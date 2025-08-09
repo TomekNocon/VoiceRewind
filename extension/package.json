@@ -8,6 +8,7 @@
     "watch": "node build.js --watch"
   },
   "devDependencies": {
+    "@types/chrome": "^0.0.269",
     "esbuild": "^0.21.5",
     "typescript": "^5.5.4"
   }

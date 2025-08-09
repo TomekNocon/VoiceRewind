@@ -13,6 +13,15 @@ await build({
   target: ['chrome110'],
 });
 
+await build({
+  entryPoints: ['src/background.ts'],
+  outfile: `${outdir}/background.js`,
+  bundle: true,
+  format: 'iife',
+  sourcemap: true,
+  target: ['chrome110'],
+});
+
 copyFileSync('manifest.json', `${outdir}/manifest.json`);
 try { copyFileSync('icon128.png', `${outdir}/icon128.png`); } catch {}
 console.log('Built extension to dist/'); 

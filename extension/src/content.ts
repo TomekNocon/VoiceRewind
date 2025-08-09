@@ -13,17 +13,94 @@ type IntentMessage = {
 const DAEMON_WS = 'ws://127.0.0.1:17321';
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
+let isActiveTab = false;
+
+function ensureOverlay() {
+  if (document.getElementById('voicerewind-overlay')) return;
+  const root = document.createElement('div');
+  root.id = 'voicerewind-overlay';
+  root.style.position = 'fixed';
+  root.style.right = '12px';
+  root.style.bottom = '12px';
+  root.style.zIndex = '2147483647';
+  root.style.fontFamily = 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+  root.style.background = 'rgba(0,0,0,0.6)';
+  root.style.color = '#fff';
+  root.style.padding = '8px 10px';
+  root.style.borderRadius = '8px';
+  root.style.display = 'flex';
+  root.style.gap = '8px';
+  root.style.alignItems = 'center';
+
+  const status = document.createElement('span');
+  status.id = 'vr-status';
+  status.textContent = '●';
+  status.style.color = '#f44336';
+
+  const active = document.createElement('span');
+  active.id = 'vr-active';
+  active.textContent = '(inactive)';
+  active.style.opacity = '0.8';
+
+  const btn = (label: string, onClick: () => void) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.background = '#121212';
+    b.style.color = '#fff';
+    b.style.border = '1px solid #333';
+    b.style.borderRadius = '6px';
+    b.style.padding = '4px 8px';
+    b.style.cursor = 'pointer';
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onClick();
+    });
+    return b;
+  };
+
+  const rew = btn('⏪ 10s', () => handleIntent({ intent: 'rewind', value: 10 }));
+  const fwd = btn('⏩ 10s', () => handleIntent({ intent: 'forward', value: 10 }));
+  const spdDown = btn('− speed', () => {
+    const v = Math.max(0.25, (getVideo()?.playbackRate ?? 1) - 0.25);
+    handleIntent({ intent: 'set_speed', value: v });
+  });
+  const spdUp = btn('+ speed', () => {
+    const v = Math.min(3, (getVideo()?.playbackRate ?? 1) + 0.25);
+    handleIntent({ intent: 'set_speed', value: v });
+  });
+
+  root.append(status, active, rew, fwd, spdDown, spdUp);
+  document.body.appendChild(root);
+}
+
+function setStatus(connected: boolean) {
+  const el = document.getElementById('vr-status');
+  if (!el) return;
+  el.textContent = connected ? '●' : '○';
+  (el as HTMLElement).style.color = connected ? '#4caf50' : '#f44336';
+}
+
+function setActive(active: boolean) {
+  const el = document.getElementById('vr-active');
+  if (!el) return;
+  el.textContent = active ? '(active)' : '(inactive)';
+  (el as HTMLElement).style.opacity = active ? '1' : '0.8';
+}
 
 function connect() {
+  ensureOverlay();
   try {
     ws = new WebSocket(DAEMON_WS);
     ws.addEventListener('open', () => {
       console.log('[VoiceRewind] Connected to daemon');
+      setStatus(true);
     });
     ws.addEventListener('message', (ev) => {
       try {
         const msg = JSON.parse(ev.data as string) as IntentMessage;
         console.log('[VoiceRewind] Received', msg);
+        if (!isActiveTab) return; // only active tab handles remote intents
         handleIntent(msg);
       } catch (e) {
         console.warn('[VoiceRewind] Bad message', e);
@@ -31,10 +108,12 @@ function connect() {
     });
     ws.addEventListener('close', () => {
       console.log('[VoiceRewind] Disconnected, retrying…');
+      setStatus(false);
       scheduleReconnect();
     });
     ws.addEventListener('error', () => {
       console.log('[VoiceRewind] WS error, retrying…');
+      setStatus(false);
       scheduleReconnect();
     });
   } catch {
@@ -56,7 +135,6 @@ function isVisible(el: HTMLElement): boolean {
 }
 
 function getVideo(): HTMLVideoElement | null {
-  // Prefer the main YouTube player element
   const candidates: HTMLVideoElement[] = [];
   const bySelector = document.querySelector('video.html5-main-video') as HTMLVideoElement | null;
   if (bySelector) candidates.push(bySelector);
@@ -64,7 +142,6 @@ function getVideo(): HTMLVideoElement | null {
   if (inMoviePlayer) candidates.push(inMoviePlayer);
   candidates.push(...Array.from(document.querySelectorAll('video')));
 
-  // Deduplicate and pick the most visible/largest
   const unique = Array.from(new Set(candidates));
   if (unique.length === 0) return null;
   unique.sort((a, b) => {
@@ -141,11 +218,9 @@ async function handleIntent(msg: IntentMessage) {
 }
 
 async function findTimestampForPhrase(phrase: string): Promise<number | null> {
-  // Use available text tracks (captions) if present
   const video = getVideo();
   if (!video) return null;
   const tracks = Array.from(video.textTracks || []);
-  // Prefer the active or showing track
   const track = tracks.find((tr) => tr.mode === 'showing') || tracks[0];
   if (!track || !track.cues) return null;
   const cues = Array.from(track.cues) as TextTrackCue[];
@@ -163,4 +238,20 @@ async function findTimestampForPhrase(phrase: string): Promise<number | null> {
   return best?.startTime ?? null;
 }
 
+// Background messages
+window.addEventListener('message', () => {});
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'active-tab') {
+    isActiveTab = true;
+    setActive(true);
+  }
+  if (msg?.type === 'heartbeat') {
+    ensureOverlay();
+  }
+});
+
+// Initialize
+ensureOverlay();
+setStatus(false);
+setActive(false);
 connect(); 
