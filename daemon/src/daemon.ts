@@ -4,6 +4,9 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import type { Express } from 'express';
 import OpenAI from 'openai';
+import os from 'os';
+import fs from 'fs';
+import path from 'path';
 
 const PORT = Number(process.env.PORT ?? 17321);
 const ENABLE_AUDIO = String(process.env.ENABLE_AUDIO ?? 'false').toLowerCase() === 'true';
@@ -11,6 +14,31 @@ const WAKE_KEYWORD = process.env.WAKE_KEYWORD ?? 'Jarvis'; // builtin by default
 const SENSITIVITY = Math.max(0, Math.min(1, Number(process.env.SENSITIVITY ?? '0.6')));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// JSON cache on disk
+const CACHE_DIR = path.join(process.cwd(), 'cache', 'transcripts');
+function ensureCacheDir() {
+  try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch {}
+}
+function cachePath(videoId: string) { return path.join(CACHE_DIR, `${videoId}.json`); }
+function readDiskCache(videoId: string): any[] | null {
+  try {
+    const fp = cachePath(videoId);
+    if (fs.existsSync(fp)) {
+      const raw = fs.readFileSync(fp, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed?.segments)) return parsed.segments;
+    }
+  } catch {}
+  return null;
+}
+function writeDiskCache(videoId: string, segments: any[]) {
+  try {
+    ensureCacheDir();
+    fs.writeFileSync(cachePath(videoId), JSON.stringify(segments, null, 2), 'utf8');
+  } catch {}
+}
 
 // Simple intent schema
 export type IntentMessage = {
@@ -37,6 +65,157 @@ app.post('/simulate', (req, res) => {
   broadcast(msg);
   res.json({ ok: true });
 });
+
+// Transcript endpoint (YouTube official captions if available; Whisper fallback if not)
+const transcriptCache = new Map<string, any[]>();
+app.get('/transcript', async (req, res) => {
+  const videoId = String(req.query.videoId ?? '').trim();
+  const force = String(req.query.force ?? '').trim() === '1';
+  if (!videoId) return res.status(400).json({ error: 'missing videoId' });
+  try {
+    // Disk cache
+    if (!force) {
+      const disk = readDiskCache(videoId);
+      if (disk && disk.length) {
+        console.log(`[daemon] /transcript disk cache hit ${videoId} segments=${disk.length}`);
+        transcriptCache.set(videoId, disk);
+        return res.json({ segments: disk });
+      }
+    }
+
+    if (transcriptCache.has(videoId) && !force) {
+      console.log(`[daemon] /transcript cache hit ${videoId}`);
+      return res.json({ segments: transcriptCache.get(videoId) });
+    }
+    let segments: any[] = [];
+    if (!force) {
+      console.log(`[daemon] /transcript fetching timedtext for ${videoId}`);
+      const { YoutubeTranscript } = await import('youtube-transcript');
+      const languages = ['en', 'en-US', 'en-GB', 'auto', 'pl', 'es', 'de', 'fr'];
+      for (const lang of languages) {
+        try {
+          // @ts-ignore optional lang param supported by lib
+          // eslint-disable-next-line no-await-in-loop
+          segments = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+          console.log(`[daemon] timedtext lang=${lang} segments=${Array.isArray(segments) ? segments.length : 0}`);
+          if (Array.isArray(segments) && segments.length) break;
+        } catch (e) {
+          console.warn(`[daemon] timedtext failed lang=${lang}`, e);
+        }
+      }
+    }
+
+    if (!Array.isArray(segments) || segments.length === 0) {
+      // Try raw timedtext XML for 'en'
+      try {
+        const timedUrl = `https://www.youtube.com/api/timedtext?lang=en&v=${encodeURIComponent(videoId)}`;
+        console.log('[daemon] trying raw timedtext XML', timedUrl);
+        const resp = await fetch(timedUrl);
+        if (resp.ok) {
+          const xml = await resp.text();
+          const { XMLParser } = await import('fast-xml-parser');
+          const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' });
+          const data: any = parser.parse(xml);
+          const texts = data?.transcript?.text ?? [];
+          const arr = Array.isArray(texts) ? texts : [texts];
+          const parsed = arr
+            .filter(Boolean)
+            .map((t: any) => ({ text: String(t['#text'] ?? ''), start: Number(t.start ?? 0), duration: Number(t.dur ?? 0) }));
+          if (parsed.length) {
+            console.log(`[daemon] raw timedtext segments=${parsed.length}`);
+            transcriptCache.set(videoId, parsed);
+            writeDiskCache(videoId, parsed);
+            return res.json({ segments: parsed });
+          }
+        }
+      } catch (e) {
+        console.warn('[daemon] raw timedtext fetch failed', e);
+      }
+
+      console.log(`[daemon] falling back to Whisper for ${videoId}`);
+      const whisper = await transcriptWithWhisper(videoId);
+      console.log(`[daemon] whisper segments=${whisper.length}`);
+      transcriptCache.set(videoId, whisper);
+      writeDiskCache(videoId, whisper);
+      return res.json({ segments: whisper });
+    }
+
+    transcriptCache.set(videoId, segments);
+    writeDiskCache(videoId, segments);
+    res.json({ segments });
+  } catch (e: any) {
+    console.error('[daemon] /transcript error', e);
+    res.status(200).json({ segments: [] });
+  }
+});
+
+async function transcriptWithWhisper(videoId: string): Promise<Array<{ text: string; start: number; duration: number }>> {
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn('[daemon] whisper skipped: OPENAI_API_KEY missing');
+    return [];
+  }
+  try {
+    console.log(`[daemon] whisper: downloading audio for ${videoId}`);
+    const { default: ytdl } = await import('@distube/ytdl-core');
+    const ffmpegPath = (await import('ffmpeg-static')).default as string;
+    const ffmpeg = (await import('fluent-ffmpeg')).default;
+    ffmpeg.setFfmpegPath(ffmpegPath);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vrw-'));
+    const tmpMp4 = path.join(tmpDir, `${videoId}.mp4`);
+    const tmpWav = path.join(tmpDir, `${videoId}.wav`);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const stream = ytdl(`https://www.youtube.com/watch?v=${videoId}`, { quality: 'highestaudio', filter: 'audioonly' });
+        const file = fs.createWriteStream(tmpMp4);
+        stream.pipe(file);
+        file.on('finish', () => resolve());
+        file.on('error', reject);
+        stream.on('error', reject);
+      });
+      console.log('[daemon] whisper: audio downloaded');
+
+      await new Promise<void>((resolve, reject) => {
+        ffmpeg(tmpMp4)
+          .noVideo()
+          .audioChannels(1)
+          .audioFrequency(16000)
+          .format('wav')
+          .duration(600)
+          .save(tmpWav)
+          .on('end', () => resolve())
+          .on('error', (err: any) => reject(err));
+      });
+      console.log('[daemon] whisper: audio converted');
+
+      const file = await OpenAI.toFile(fs.createReadStream(tmpWav) as any, 'audio.wav');
+      const tr: any = await openai.audio.transcriptions.create({
+        file,
+        model: 'whisper-1',
+        response_format: 'verbose_json',
+        temperature: 0
+      } as any);
+      const out: Array<{ text: string; start: number; duration: number }> = [];
+      const segs: any[] = tr?.segments ?? [];
+      for (const s of segs) {
+        const start = Number(s.start ?? 0);
+        const end = Number(s.end ?? start);
+        const text = String(s.text ?? '').trim();
+        if (!text) continue;
+        out.push({ text, start, duration: Math.max(0, end - start) });
+      }
+      return out;
+    } finally {
+      try { fs.unlinkSync(tmpMp4); } catch {}
+      try { fs.unlinkSync(tmpWav); } catch {}
+      try { fs.rmdirSync(tmpDir); } catch {}
+    }
+  } catch (e) {
+    console.error('[daemon] whisper error', e);
+    return [];
+  }
+}
 
 // Create a single server for both HTTP and WS
 const server = createServer(app);

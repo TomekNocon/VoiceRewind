@@ -22,4 +22,7 @@ daemon/.env
 
 # Editor
 .vscode/
-.idea/ 
+.idea/
+
+# App cache
+cache/ 

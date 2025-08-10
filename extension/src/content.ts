@@ -13,11 +13,60 @@ type IntentMessage = {
 };
 
 const DAEMON_WS = 'ws://127.0.0.1:17321';
+const DAEMON_HTTP = 'http://127.0.0.1:17321';
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let isActiveTab = false;
 let prevVolume: number | null = null;
 let wasPlayingBeforeListen: boolean | null = null;
+
+let cachedTranscript: { text: string; offset?: number; start?: number; duration?: number }[] | null = null;
+let cachedVideoId: string | null = null;
+
+function getVideoIdFromUrl(): string | null {
+  try {
+    const href = location.href;
+    const u = new URL(href);
+    // Standard watch
+    const vParam = u.searchParams.get('v');
+    if (vParam) return vParam;
+    // Shorts
+    const shortsMatch = href.match(/\/shorts\/([a-zA-Z0-9_-]{5,})/);
+    if (shortsMatch) return shortsMatch[1];
+    // youtu.be short links
+    const youtu = href.match(/https?:\/\/youtu\.be\/([a-zA-Z0-9_-]{5,})/);
+    if (youtu) return youtu[1];
+  } catch {}
+  return null;
+}
+
+async function ensureTranscript(): Promise<void> {
+  const vid = getVideoIdFromUrl();
+  if (!vid) return;
+  if (cachedTranscript && cachedVideoId === vid) return;
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'fetchTranscript', videoId: vid });
+    if (resp?.ok && Array.isArray(resp?.data?.segments)) {
+      cachedTranscript = resp.data.segments;
+      cachedVideoId = vid;
+      console.log('[VoiceRewind] Transcript loaded', (cachedTranscript ? cachedTranscript.length : 0));
+    } else {
+      console.warn('[VoiceRewind] Transcript fetch failed', resp?.error);
+    }
+  } catch (e) {
+    console.warn('[VoiceRewind] Transcript error', e);
+  }
+}
+
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^a-z0-9\s]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function ensureOverlay() {
   if (document.getElementById('voicerewind-overlay')) return;
@@ -45,6 +94,25 @@ function ensureOverlay() {
   active.id = 'vr-active';
   active.textContent = '(inactive)';
   active.style.opacity = '0.8';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'jump to…';
+  input.style.background = '#121212';
+  input.style.color = '#fff';
+  input.style.border = '1px solid #333';
+  input.style.borderRadius = '6px';
+  input.style.padding = '4px 8px';
+  input.style.width = '160px';
+  input.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      const q = input.value.trim();
+      if (q) {
+        await ensureTranscript();
+        await handleIntent({ intent: 'jump_to_phrase', value: q });
+      }
+    }
+  });
 
   const btn = (label: string, onClick: () => void) => {
     const b = document.createElement('button');
@@ -74,7 +142,7 @@ function ensureOverlay() {
     handleIntent({ intent: 'set_speed', value: v });
   });
 
-  root.append(status, active, rew, fwd, spdDown, spdUp);
+  root.append(status, active, input, rew, fwd, spdDown, spdUp);
   document.body.appendChild(root);
 }
 
@@ -245,22 +313,41 @@ async function handleIntent(msg: IntentMessage) {
 async function findTimestampForPhrase(phrase: string): Promise<number | null> {
   const video = getVideo();
   if (!video) return null;
+
+  const qNorm = normalize(phrase);
+
+  // 1) Try text tracks
   const tracks = Array.from(video.textTracks || []);
   const track = tracks.find((tr) => tr.mode === 'showing') || tracks[0];
-  if (!track || !track.cues) return null;
-  const cues = Array.from(track.cues) as TextTrackCue[];
-  const lower = phrase.toLowerCase();
-  let best: { startTime: number; idx: number } | null = null;
-  for (let i = 0; i < cues.length; i++) {
-    const cue = cues[i] as any;
-    const text: string = (cue.text || '').toString();
-    if (!text) continue;
-    if (text.toLowerCase().includes(lower)) {
-      const s = (cue.startTime as number) ?? 0;
-      if (!best || s < best.startTime) best = { startTime: s, idx: i };
+  if (track && track.cues) {
+    const cues = Array.from(track.cues) as TextTrackCue[];
+    for (let i = 0; i < cues.length; i++) {
+      const cue = cues[i] as any;
+      const text: string = (cue.text || '').toString();
+      if (!text) continue;
+      if (normalize(text).includes(qNorm)) {
+        return (cue.startTime as number) ?? 0;
+      }
     }
   }
-  return best?.startTime ?? null;
+
+  // 2) Fallback to daemon transcript (merge windows of segments for fuzzy match)
+  await ensureTranscript();
+  if (cachedTranscript && cachedTranscript.length) {
+    const windowSize = 3; // merge up to 3 segments for better context
+    for (let i = 0; i < cachedTranscript.length; i++) {
+      let merged = '';
+      for (let w = 0; w < windowSize && i + w < cachedTranscript.length; w++) {
+        merged += ' ' + (cachedTranscript[i + w]?.text ?? '');
+        if (normalize(merged).includes(qNorm)) {
+          const seg = cachedTranscript[i];
+          const startSec = typeof seg.start === 'number' ? seg.start : (typeof seg.offset === 'number' ? seg.offset / 1000 : 0);
+          return Math.max(0, startSec);
+        }
+      }
+    }
+  }
+  return null;
 }
 
 // Background messages
