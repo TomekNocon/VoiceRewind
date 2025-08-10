@@ -1,5 +1,7 @@
 type IntentMessage = {
   intent:
+    | 'begin_listen'
+    | 'end_listen'
     | 'rewind'
     | 'forward'
     | 'set_speed'
@@ -14,6 +16,8 @@ const DAEMON_WS = 'ws://127.0.0.1:17321';
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let isActiveTab = false;
+let prevVolume: number | null = null;
+let wasPlayingBeforeListen: boolean | null = null;
 
 function ensureOverlay() {
   if (document.getElementById('voicerewind-overlay')) return;
@@ -100,7 +104,7 @@ function connect() {
       try {
         const msg = JSON.parse(ev.data as string) as IntentMessage;
         console.log('[VoiceRewind] Received', msg);
-        if (!isActiveTab) return; // only active tab handles remote intents
+        if (!isActiveTab && msg.intent !== 'begin_listen' && msg.intent !== 'end_listen') return;
         handleIntent(msg);
       } catch (e) {
         console.warn('[VoiceRewind] Bad message', e);
@@ -162,6 +166,27 @@ function clamp(v: number, lo: number, hi: number) {
 
 async function handleIntent(msg: IntentMessage) {
   const video = getVideo();
+  if (msg.intent === 'begin_listen') {
+    if (video) {
+      if (prevVolume === null) prevVolume = video.volume;
+      if (wasPlayingBeforeListen === null) wasPlayingBeforeListen = !video.paused;
+      video.volume = 0;
+      if (!video.paused) video.pause();
+    }
+    return;
+  }
+  if (msg.intent === 'end_listen') {
+    if (video) {
+      if (prevVolume !== null) video.volume = prevVolume;
+      prevVolume = null;
+      if (wasPlayingBeforeListen) {
+        await video.play().catch(() => {});
+      }
+      wasPlayingBeforeListen = null;
+    }
+    return;
+  }
+
   if (!video) {
     console.warn('[VoiceRewind] No video element found');
     return;
