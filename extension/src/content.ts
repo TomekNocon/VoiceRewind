@@ -22,6 +22,27 @@ let wasPlayingBeforeListen: boolean | null = null;
 
 let cachedTranscript: { text: string; offset?: number; start?: number; duration?: number }[] | null = null;
 let cachedVideoId: string | null = null;
+let answerBox: HTMLDivElement | null = null;
+let playAnswerBtn: HTMLButtonElement | null = null;
+let pendingSpeakText: string | null = null;
+let lastAudioDataUrl: string | null = null;
+let lastAudioUrl: string | null = null;
+let micBtn: HTMLButtonElement | null = null;
+let recognition: any = null;
+let recognizing = false;
+
+function speakText(text: string, onEnd: () => void) {
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    u.onend = onEnd;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  } catch {
+    onEnd();
+  }
+}
 
 function getVideoIdFromUrl(): string | null {
   try {
@@ -66,6 +87,19 @@ function normalize(s: string): string {
     .replace(/[^a-z0-9\s]/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function createRecognition() {
+  try {
+    const w: any = window as any;
+    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Ctor) return null;
+    const rec = new Ctor();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    return rec;
+  } catch { return null; }
 }
 
 function ensureOverlay() {
@@ -114,6 +148,103 @@ function ensureOverlay() {
     }
   });
 
+  // Ask agent input
+  const ask = document.createElement('input');
+  ask.type = 'text';
+  ask.placeholder = 'ask the web…';
+  ask.style.background = '#121212';
+  ask.style.color = '#fff';
+  ask.style.border = '1px solid #333';
+  ask.style.borderRadius = '6px';
+  ask.style.padding = '4px 8px';
+  ask.style.width = '200px';
+  ask.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      const q = ask.value.trim();
+      if (q) await queryAgent(q);
+    }
+  });
+
+  answerBox = document.createElement('div');
+  answerBox.style.maxWidth = '420px';
+  answerBox.style.fontSize = '12px';
+  answerBox.style.lineHeight = '1.2';
+  answerBox.style.maxHeight = '6em';
+  answerBox.style.overflow = 'auto';
+  answerBox.style.display = 'none';
+
+  playAnswerBtn = document.createElement('button');
+  playAnswerBtn.textContent = 'Play answer';
+  playAnswerBtn.style.display = 'none';
+  playAnswerBtn.style.background = '#121212';
+  playAnswerBtn.style.color = '#fff';
+  playAnswerBtn.style.border = '1px solid #333';
+  playAnswerBtn.style.borderRadius = '6px';
+  playAnswerBtn.style.padding = '4px 8px';
+  playAnswerBtn.style.cursor = 'pointer';
+  playAnswerBtn.onclick = async () => {
+    const video = getVideo();
+    if (!video) return;
+    const prevWasPlaying = !video.paused;
+    const prevVol = video.volume;
+    video.pause();
+    video.volume = 0;
+    playAnswerBtn!.style.display = 'none';
+    await playAnswerAudioOrSpeak(video, prevWasPlaying, prevVol);
+  };
+
+  // Mic button
+  micBtn = document.createElement('button');
+  micBtn.textContent = '🎤';
+  micBtn.title = 'Hold to speak, release to send';
+  micBtn.style.background = '#121212';
+  micBtn.style.color = '#fff';
+  micBtn.style.border = '1px solid #333';
+  micBtn.style.borderRadius = '6px';
+  micBtn.style.padding = '4px 8px';
+  micBtn.style.cursor = 'pointer';
+
+  recognition = createRecognition();
+  if (recognition) {
+    let interim = '';
+    let finalText = '';
+    recognition.onresult = (e: any) => {
+      interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t;
+        else interim += t;
+      }
+      // Update ask field live
+      const askInput = Array.from(document.querySelectorAll('input')).find((el: any) => el.placeholder === 'ask the web…') as HTMLInputElement | undefined;
+      if (askInput) askInput.value = (finalText + ' ' + interim).trim();
+    };
+    recognition.onend = async () => {
+      recognizing = false;
+      micBtn!.textContent = '🎤';
+      const askInput = Array.from(document.querySelectorAll('input')).find((el: any) => el.placeholder === 'ask the web…') as HTMLInputElement | undefined;
+      const q = askInput?.value?.trim();
+      if (q) await queryAgent(q);
+    };
+    micBtn.onmousedown = () => {
+      if (recognizing) return;
+      recognizing = true;
+      finalText = '';
+      recognition.start();
+      micBtn!.textContent = '●';
+    };
+    micBtn.onmouseup = () => {
+      if (!recognizing) return;
+      recognition.stop();
+    };
+    micBtn.onmouseleave = () => {
+      if (recognizing) recognition.stop();
+    };
+  } else {
+    micBtn.disabled = true;
+    micBtn.title = 'Voice not supported in this browser';
+  }
+
   const btn = (label: string, onClick: () => void) => {
     const b = document.createElement('button');
     b.textContent = label;
@@ -142,7 +273,7 @@ function ensureOverlay() {
     handleIntent({ intent: 'set_speed', value: v });
   });
 
-  root.append(status, active, input, rew, fwd, spdDown, spdUp);
+  root.append(status, active, input, rew, fwd, spdDown, spdUp, micBtn, ask, answerBox, playAnswerBtn);
   document.body.appendChild(root);
 }
 
@@ -303,6 +434,21 @@ async function handleIntent(msg: IntentMessage) {
           video.currentTime = t;
           console.log('[VoiceRewind] JumpToPhrase', { before, after: t });
         } else {
+          // Semantic fallback
+          const vid = getVideoIdFromUrl();
+          if (vid) {
+            try {
+              const resp = await chrome.runtime.sendMessage({ type: 'semanticSearch', videoId: vid, q: msg.value.trim() });
+              if (resp?.ok && typeof resp.data?.start === 'number') {
+                const before = video.currentTime;
+                video.currentTime = Math.max(0, resp.data.start);
+                console.log('[VoiceRewind] JumpToPhrase (semantic)', { before, after: resp.data.start, score: resp.data.score });
+                break;
+              }
+            } catch (e) {
+              console.warn('[VoiceRewind] Semantic search failed', e);
+            }
+          }
           console.warn('[VoiceRewind] Phrase not found');
         }
       }
@@ -348,6 +494,89 @@ async function findTimestampForPhrase(phrase: string): Promise<number | null> {
     }
   }
   return null;
+}
+
+// Helper to play ElevenLabs audio data URL (if present) or fallback to Web Speech / open new tab
+async function playAnswerAudioOrSpeak(video: HTMLVideoElement, prevWasPlaying: boolean, prevVol: number) {
+  const restore = () => {
+    video.volume = prevVol;
+    if (prevWasPlaying) video.play().catch(() => {});
+  };
+  if (lastAudioDataUrl) {
+    try {
+      const audio = new Audio(lastAudioDataUrl);
+      audio.controls = true;
+      audio.style.display = 'block';
+      const root = document.getElementById('voicerewind-overlay');
+      if (root) root.appendChild(audio);
+      const onEnd = () => {
+        audio.removeEventListener('ended', onEnd);
+        try { audio.pause(); } catch {}
+        if (root && audio.parentElement === root) root.removeChild(audio);
+        restore();
+      };
+      audio.addEventListener('ended', onEnd);
+      const tried = await audio.play().catch(() => {});
+      if (audio.paused || audio.currentTime === 0) {
+        // Open in new tab as last resort to force ElevenLabs playback
+        if (lastAudioUrl) window.open(lastAudioUrl, '_blank');
+        if (root && audio.parentElement === root) root.removeChild(audio);
+        restore();
+      }
+      return;
+    } catch {
+      // final fallback to Web Speech
+      if (pendingSpeakText) speakText(pendingSpeakText, restore);
+      return;
+    }
+  }
+  // No MP3 available
+  if (pendingSpeakText) speakText(pendingSpeakText, restore);
+}
+
+async function queryAgent(q: string) {
+  const vid = getVideoIdFromUrl();
+  const video = getVideo();
+  const currentTime = video ? video.currentTime : 0;
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'agentQuery', q, videoId: vid, currentTime });
+    if (!resp?.ok) throw new Error(resp?.error || 'agent failed');
+    const { text, sources, audioUrl } = resp.data || {};
+    if (answerBox) {
+      answerBox.style.display = 'block';
+      const citation = Array.isArray(sources) && sources.length ? '\n\n' + sources.map((s: any) => `[${s.i}] ${s.title} - ${s.url}`).join('\n') : '';
+      answerBox.textContent = (text || '') + citation;
+    }
+    pendingSpeakText = text || '';
+    lastAudioDataUrl = null;
+    lastAudioUrl = null;
+    if (audioUrl) {
+      try {
+        // Store absolute raw URL for tab fallback
+        try { lastAudioUrl = new URL(audioUrl, 'http://127.0.0.1:17321').toString(); } catch { lastAudioUrl = null; }
+        const aResp = await chrome.runtime.sendMessage({ type: 'fetchAudioDataUrl', url: lastAudioUrl || audioUrl });
+        if (aResp?.ok && aResp.dataUrl) lastAudioDataUrl = aResp.dataUrl as string;
+      } catch {}
+    }
+    if (video) {
+      const prevWasPlaying = !video.paused;
+      const prevVol = video.volume;
+      video.pause();
+      video.volume = 0;
+      // Try ElevenLabs MP3 first (in-DOM audio with controls)
+      if (lastAudioDataUrl) {
+        await playAnswerAudioOrSpeak(video, prevWasPlaying, prevVol);
+        return;
+      }
+      // No server audio; show button to speak via Web Speech
+      if (playAnswerBtn) playAnswerBtn.style.display = 'inline-block';
+    }
+  } catch (e) {
+    if (answerBox) {
+      answerBox.style.display = 'block';
+      answerBox.textContent = 'Agent error';
+    }
+  }
 }
 
 // Background messages

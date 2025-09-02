@@ -12,15 +12,24 @@ const PORT = Number(process.env.PORT ?? 17321);
 const ENABLE_AUDIO = String(process.env.ENABLE_AUDIO ?? 'false').toLowerCase() === 'true';
 const WAKE_KEYWORD = process.env.WAKE_KEYWORD ?? 'Jarvis'; // builtin by default; set to a .ppn path for custom
 const SENSITIVITY = Math.max(0, Math.min(1, Number(process.env.SENSITIVITY ?? '0.6')));
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small';
+const CHAT_MODEL = process.env.CHAT_MODEL ?? 'gpt-4o-mini';
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? '';
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY ?? '';
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? '21m00Tcm4TlvDq8ikWAM'; // Rachel
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // JSON cache on disk
 const CACHE_DIR = path.join(process.cwd(), 'cache', 'transcripts');
+const MEDIA_DIR = path.join(process.cwd(), 'cache', 'agent_media');
 function ensureCacheDir() {
   try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch {}
+  try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 }
 function cachePath(videoId: string) { return path.join(CACHE_DIR, `${videoId}.json`); }
+function embedPath(videoId: string) { return path.join(CACHE_DIR, `${videoId}.embeddings.json`); }
+function mediaPath(basename: string) { return path.join(MEDIA_DIR, basename); }
 function readDiskCache(videoId: string): any[] | null {
   try {
     const fp = cachePath(videoId);
@@ -37,6 +46,23 @@ function writeDiskCache(videoId: string, segments: any[]) {
   try {
     ensureCacheDir();
     fs.writeFileSync(cachePath(videoId), JSON.stringify(segments, null, 2), 'utf8');
+  } catch {}
+}
+function readEmbedCache(videoId: string): null | { model: string; dims: number; items: { idx: number; start: number; duration: number; text: string; embedding: number[] }[] } {
+  try {
+    const fp = embedPath(videoId);
+    if (!fs.existsSync(fp)) return null;
+    const raw = fs.readFileSync(fp, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function writeEmbedCache(videoId: string, payload: { model: string; dims: number; items: { idx: number; start: number; duration: number; text: string; embedding: number[] }[] }) {
+  try {
+    ensureCacheDir();
+    fs.writeFileSync(embedPath(videoId), JSON.stringify(payload, null, 2), 'utf8');
   } catch {}
 }
 
@@ -58,6 +84,7 @@ export type IntentMessage = {
 // Minimal HTTP API for simulation and health
 const app: Express = express();
 app.use(express.json());
+app.use('/media', express.static(MEDIA_DIR));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.post('/simulate', (req, res) => {
   const msg = req.body as IntentMessage;
@@ -182,7 +209,7 @@ async function transcriptWithWhisper(videoId: string): Promise<Array<{ text: str
           .audioChannels(1)
           .audioFrequency(16000)
           .format('wav')
-          .duration(600)
+          .duration(10)
           .save(tmpWav)
           .on('end', () => resolve())
           .on('error', (err: any) => reject(err));
@@ -216,6 +243,198 @@ async function transcriptWithWhisper(videoId: string): Promise<Array<{ text: str
     return [];
   }
 }
+
+// Helper to get transcript segments (shared between endpoints)
+async function getTranscriptSegments(videoId: string, force: boolean): Promise<any[]> {
+  // Disk cache
+  if (!force) {
+    const disk = readDiskCache(videoId);
+    if (disk && disk.length) {
+      console.log(`[daemon] getTranscriptSegments disk cache ${videoId} segments=${disk.length}`);
+      transcriptCache.set(videoId, disk);
+      return disk;
+    }
+  }
+  if (transcriptCache.has(videoId) && !force) {
+    const s = transcriptCache.get(videoId)!;
+    if (s.length) return s;
+  }
+  let segments: any[] = [];
+  // Try library with multiple langs
+  if (!force) {
+    try {
+      const { YoutubeTranscript } = await import('youtube-transcript');
+      const languages = ['en', 'en-US', 'en-GB', 'auto', 'pl', 'es', 'de', 'fr'];
+      for (const lang of languages) {
+        try {
+          // @ts-ignore
+          // eslint-disable-next-line no-await-in-loop
+          segments = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+          console.log(`[daemon] lib timedtext lang=${lang} segments=${Array.isArray(segments) ? segments.length : 0}`);
+          if (Array.isArray(segments) && segments.length) break;
+        } catch (e) {
+          console.warn(`[daemon] lib timedtext failed lang=${lang}`);
+        }
+      }
+    } catch {}
+  }
+  // Raw timedtext XML
+  if (!Array.isArray(segments) || segments.length === 0) {
+    try {
+      const timedUrl = `https://www.youtube.com/api/timedtext?lang=en&v=${encodeURIComponent(videoId)}`;
+      const resp = await fetch(timedUrl);
+      if (resp.ok) {
+        const xml = await resp.text();
+        const { XMLParser } = await import('fast-xml-parser');
+        const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' });
+        const data: any = parser.parse(xml);
+        const texts = data?.transcript?.text ?? [];
+        const arr = Array.isArray(texts) ? texts : [texts];
+        const parsed = arr
+          .filter(Boolean)
+          .map((t: any) => ({ text: String(t['#text'] ?? ''), start: Number(t.start ?? 0), duration: Number(t.dur ?? 0) }));
+        if (parsed.length) {
+          segments = parsed;
+        }
+      }
+    } catch {}
+  }
+  // Whisper fallback (first 10s currently)
+  if (!Array.isArray(segments) || segments.length === 0) {
+    const whisper = await transcriptWithWhisper(videoId);
+    segments = whisper;
+  }
+  transcriptCache.set(videoId, segments);
+  writeDiskCache(videoId, segments);
+  return segments;
+}
+
+function cosineSim(a: number[], b: number[]): number {
+  let dot = 0, na = 0, nb = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) { const x = a[i]; const y = b[i]; dot += x * y; na += x * x; nb += y * y; }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+async function ensureEmbeddings(videoId: string, segments: { text: string; start?: number; offset?: number; duration?: number }[], force: boolean) {
+  const existing = !force ? readEmbedCache(videoId) : null;
+  if (existing && existing.model === EMBEDDING_MODEL && Array.isArray(existing.items) && existing.items.length) {
+    return existing;
+  }
+  const inputs: string[] = segments.map(s => (s.text || '').toString());
+  const resp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: inputs });
+  const dims = resp.data[0].embedding.length;
+  const items = resp.data.map((row, idx) => {
+    const seg = segments[idx];
+    const start = typeof seg.start === 'number' ? seg.start : (typeof seg.offset === 'number' ? seg.offset / 1000 : 0);
+    const duration = typeof seg.duration === 'number' ? seg.duration : 0;
+    return { idx, start, duration, text: inputs[idx], embedding: row.embedding as unknown as number[] };
+  });
+  const payload = { model: EMBEDDING_MODEL, dims, items };
+  writeEmbedCache(videoId, payload);
+  return payload;
+}
+
+// Semantic search endpoint
+app.get('/semantic_search', async (req, res) => {
+  try {
+    const videoId = String(req.query.videoId ?? '').trim();
+    const q = String(req.query.q ?? '').trim();
+    const force = String(req.query.force ?? '').trim() === '1';
+    if (!videoId || !q) return res.status(400).json({ error: 'missing videoId or q' });
+    const segments = await getTranscriptSegments(videoId, force);
+    if (!segments.length) return res.json({ start: 0, score: 0, text: '', candidates: [] });
+    const embedIndex = await ensureEmbeddings(videoId, segments, force);
+    const qEmb = (await openai.embeddings.create({ model: EMBEDDING_MODEL, input: q })).data[0].embedding as unknown as number[];
+    let best = { score: -1, start: 0, text: '', idx: -1 };
+    const candidates: { start: number; score: number; text: string }[] = [];
+    for (const item of embedIndex.items) {
+      const s = cosineSim(qEmb, item.embedding);
+      candidates.push({ start: item.start, score: s, text: item.text });
+      if (s > best.score) best = { score: s, start: item.start, text: item.text, idx: item.idx };
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    res.json({ start: best.start, score: best.score, text: best.text, index: best.idx, candidates: candidates.slice(0, 5) });
+  } catch (e) {
+    console.error('[daemon] /semantic_search error', e);
+    res.status(500).json({ error: 'semantic search failed' });
+  }
+});
+
+async function tavilySearch(query: string): Promise<Array<{ title: string; url: string; content: string }>> {
+  if (!TAVILY_API_KEY) return [];
+  try {
+    const resp = await fetch('https://api.tavily.com/search', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: 'basic', max_results: 5, include_answer: false })
+    });
+    if (!resp.ok) return [];
+    const data: any = await resp.json();
+    const results: any[] = data?.results ?? [];
+    return results.map(r => ({ title: String(r.title ?? ''), url: String(r.url ?? ''), content: String(r.content ?? '') }));
+  } catch { return []; }
+}
+
+async function synthesizeAnswer(question: string, sources: Array<{ title: string; url: string; content: string }>, context?: string): Promise<string> {
+  const sys = `You are a helpful research assistant. Answer concisely (3-6 sentences). Use the provided web results and optional video context. Include inline citations like [1], [2] mapping to the provided sources by index. If unsure, say so.`;
+  const sourceList = sources.map((s, i) => `[${i + 1}] ${s.title} - ${s.url}\n${s.content}`).join('\n\n');
+  const user = `Question: ${question}\n\nVideo context (optional):\n${context ?? '(none)'}\n\nWeb results:\n${sourceList}`;
+  const chat = await openai.chat.completions.create({
+    model: CHAT_MODEL,
+    messages: [ { role: 'system', content: sys }, { role: 'user', content: user } ],
+    temperature: 0.2
+  });
+  return chat.choices[0]?.message?.content ?? '';
+}
+
+async function elevenTTS(text: string): Promise<string | null> {
+  if (!ELEVEN_API_KEY) return null;
+  const fileBase = `ans-${Date.now()}.mp3`;
+  const outPath = mediaPath(fileBase);
+  try {
+    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'xi-api-key': ELEVEN_API_KEY, 'Accept': 'audio/mpeg' },
+      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+    });
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    ensureCacheDir();
+    fs.writeFileSync(outPath, buf);
+    return `/media/${fileBase}`;
+  } catch {
+    return null;
+  }
+}
+
+app.post('/agent/query', async (req, res) => {
+  try {
+    const q = String(req.body?.q ?? '').trim();
+    const videoId = String(req.body?.videoId ?? '').trim();
+    const currentTime = Number(req.body?.currentTime ?? 0);
+    if (!q) return res.status(400).json({ error: 'missing q' });
+    // Build brief context from transcript near current time
+    let context = '';
+    if (videoId) {
+      const segs = await getTranscriptSegments(videoId, false);
+      if (segs.length) {
+        const around = segs.filter((s: any) => {
+          const start = typeof s.start === 'number' ? s.start : (typeof s.offset === 'number' ? s.offset / 1000 : 0);
+          return Math.abs(start - currentTime) <= 90; // +/- 90s
+        }).slice(0, 20).map((s: any) => s.text).join(' ');
+        context = around;
+      }
+    }
+    const web = await tavilySearch(q);
+    const answer = await synthesizeAnswer(q, web, context);
+    const audioUrl = await elevenTTS(answer);
+    res.json({ text: answer, sources: web.map((s, i) => ({ i: i + 1, title: s.title, url: s.url })), audioUrl });
+  } catch (e) {
+    console.error('[daemon] /agent/query error', e);
+    res.status(500).json({ error: 'agent failed' });
+  }
+});
 
 // Create a single server for both HTTP and WS
 const server = createServer(app);
