@@ -31,6 +31,19 @@ let micBtn: HTMLButtonElement | null = null;
 let recognition: any = null;
 let recognizing = false;
 
+// Add: simple session id per page load for conversational continuity
+let sessionId: string | null = null;
+function generateSessionId(): string {
+  try {
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+  }
+}
+if (!sessionId) sessionId = generateSessionId();
+
 function speakText(text: string, onEnd: () => void) {
   try {
     const u = new SpeechSynthesisUtterance(text);
@@ -511,16 +524,32 @@ async function playAnswerAudioOrSpeak(video: HTMLVideoElement, prevWasPlaying: b
       if (root) root.appendChild(audio);
       const onEnd = () => {
         audio.removeEventListener('ended', onEnd);
+        audio.removeEventListener('play', onPlay);
         try { audio.pause(); } catch {}
         if (root && audio.parentElement === root) root.removeChild(audio);
         restore();
       };
+      const onPlay = () => {
+        if (!video.paused) video.pause();
+        video.volume = 0;
+      };
       audio.addEventListener('ended', onEnd);
+      audio.addEventListener('play', onPlay);
       const tried = await audio.play().catch(() => {});
       if (audio.paused || audio.currentTime === 0) {
-        // Open in new tab as last resort to force ElevenLabs playback
-        if (lastAudioUrl) window.open(lastAudioUrl, '_blank');
-        if (root && audio.parentElement === root) root.removeChild(audio);
+        // Autoplay blocked: keep inline controls and prompt user to click play
+        if (root) {
+          const hint = document.createElement('div');
+          hint.textContent = 'Click ▶ to hear the answer';
+          hint.style.fontSize = '11px';
+          hint.style.opacity = '0.85';
+          hint.style.marginTop = '4px';
+          root.appendChild(hint);
+          const cleanup = () => { try { if (root && hint.parentElement === root) root.removeChild(hint); } catch {} };
+          audio.addEventListener('play', cleanup, { once: true });
+          audio.addEventListener('ended', cleanup, { once: true });
+        }
+        // Restore video while waiting for user gesture
         restore();
       }
       return;
@@ -539,7 +568,7 @@ async function queryAgent(q: string) {
   const video = getVideo();
   const currentTime = video ? video.currentTime : 0;
   try {
-    const resp = await chrome.runtime.sendMessage({ type: 'agentQuery', q, videoId: vid, currentTime });
+    const resp = await chrome.runtime.sendMessage({ type: 'agentQuery', q, videoId: vid, currentTime, sessionId });
     if (!resp?.ok) throw new Error(resp?.error || 'agent failed');
     const { text, sources, audioUrl } = resp.data || {};
     if (answerBox) {

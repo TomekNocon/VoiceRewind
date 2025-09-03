@@ -53,7 +53,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === 'agentQuery' && typeof msg.q === 'string') {
     const url = `http://127.0.0.1:17321/agent/query`;
-    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: msg.q, videoId: msg.videoId, currentTime: msg.currentTime }) })
+    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: msg.q, videoId: msg.videoId, currentTime: msg.currentTime, sessionId: msg.sessionId }) })
       .then(async (r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();

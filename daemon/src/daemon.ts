@@ -7,6 +7,7 @@ import OpenAI from 'openai';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+import { WebSocket } from 'ws';
 
 const PORT = Number(process.env.PORT ?? 17321);
 const ENABLE_AUDIO = String(process.env.ENABLE_AUDIO ?? 'false').toLowerCase() === 'true';
@@ -17,6 +18,9 @@ const CHAT_MODEL = process.env.CHAT_MODEL ?? 'gpt-4o-mini';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? '';
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY ?? '';
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? '21m00Tcm4TlvDq8ikWAM'; // Rachel
+const TOOL_SECRET = process.env.TOOL_SECRET ?? '';
+// Add: ElevenLabs Conversational Agent ID
+const ELEVEN_AGENT_ID = process.env.ELEVENLABS_AGENT_ID ?? '';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -389,50 +393,255 @@ async function synthesizeAnswer(question: string, sources: Array<{ title: string
 }
 
 async function elevenTTS(text: string): Promise<string | null> {
-  if (!ELEVEN_API_KEY) return null;
-  const fileBase = `ans-${Date.now()}.mp3`;
-  const outPath = mediaPath(fileBase);
-  try {
-    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'xi-api-key': ELEVEN_API_KEY, 'Accept': 'audio/mpeg' },
-      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
-    });
-    if (!resp.ok) return null;
-    const buf = Buffer.from(await resp.arrayBuffer());
-    ensureCacheDir();
-    fs.writeFileSync(outPath, buf);
-    return `/media/${fileBase}`;
-  } catch {
-    return null;
-  }
+	if (!ELEVEN_API_KEY) return null;
+	const fileBase = `ans-${Date.now()}.mp3`;
+	const outPath = mediaPath(fileBase);
+	try {
+		const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'xi-api-key': ELEVEN_API_KEY, 'Accept': 'audio/mpeg' },
+			body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+		});
+		if (!resp.ok) return null;
+		const buf = Buffer.from(await resp.arrayBuffer());
+		ensureCacheDir();
+		fs.writeFileSync(outPath, buf);
+		return `/media/${fileBase}`;
+	} catch {
+		return null;
+	}
+}
+
+// Add: ElevenLabs Conversational AI (WebSocket) integration
+
+async function getElevenSignedUrl(agentId: string): Promise<string | null> {
+	try {
+		if (!ELEVEN_API_KEY || !agentId) return null;
+		const primary = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(agentId)}`;
+		console.log('[convai] fetching signed url', primary);
+		let resp = await fetch(primary, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
+		if (!resp.ok) {
+			console.warn('[convai] primary signed url failed status', resp.status);
+			// try alternate path (underscore) sometimes shown in examples
+			const alt = `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${encodeURIComponent(agentId)}`;
+			console.log('[convai] trying alt signed url', alt);
+			resp = await fetch(alt, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
+			if (!resp.ok) {
+				console.warn('[convai] alt signed url failed status', resp.status);
+				return null;
+			}
+		}
+		const data: any = await resp.json();
+		const signed = String(data?.signed_url ?? '').trim();
+		console.log('[convai] signed url ok?', Boolean(signed));
+		return signed || null;
+	} catch (e) {
+		console.warn('[convai] signed url error', e);
+		return null;
+	}
+}
+
+function joinBuffers(chunks: Buffer[]): Buffer {
+	if (!chunks.length) return Buffer.alloc(0);
+	return Buffer.concat(chunks);
+}
+
+function pcmToWavFromChunks(pcmChunks: Buffer[], sampleRate = 16000, numChannels = 1): Buffer {
+	const pcm = joinBuffers(pcmChunks);
+	return pcmToWav(pcm, sampleRate, numChannels);
+}
+
+// Persistent ConvAI sessions keyed by sessionId
+const convaiSessions = new Map<string, {
+	ws: WebSocket;
+	isOpen: boolean;
+	sentInit: boolean;
+	lastAudioAt: number;
+	turnChunks: Buffer[];
+	agentText: string;
+	pending: Array<(r: { text: string; audioUrl: string | null }) => void>;
+	interval: NodeJS.Timeout | null;
+}>();
+
+async function ensureConvaiSession(sessionId: string): Promise<{
+	ws: WebSocket;
+	isOpen: boolean;
+	sentInit: boolean;
+	lastAudioAt: number;
+	turnChunks: Buffer[];
+	agentText: string;
+	pending: Array<(r: { text: string; audioUrl: string | null }) => void>;
+	interval: NodeJS.Timeout | null;
+}> {
+	let s = convaiSessions.get(sessionId);
+	if (s && s.ws.readyState === 1) return s;
+	let wsUrl = await getElevenSignedUrl(ELEVEN_AGENT_ID);
+	if (!wsUrl) wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
+	console.log('[convai] opening websocket (session)', sessionId);
+	const ws = new WebSocket(wsUrl);
+	s = { ws, isOpen: false, sentInit: false, lastAudioAt: 0, turnChunks: [], agentText: '', pending: [], interval: null };
+	convaiSessions.set(sessionId, s);
+
+	const maybeFinalizeTurn = () => {
+		if (!s) return;
+		if (!s.pending.length) return;
+		const idle = Date.now() - s.lastAudioAt;
+		// consider a turn done if we have text or audio and idled for 800ms
+		if ((s.agentText || s.turnChunks.length) && idle > 800) {
+			const textOut = s.agentText;
+			let audioUrl: string | null = null;
+			try {
+				if (s.turnChunks.length) {
+					const wav = pcmToWavFromChunks(s.turnChunks, 16000, 1);
+					const fileBase = `ans-${Date.now()}.wav`;
+					const outPath = mediaPath(fileBase);
+					ensureCacheDir();
+					fs.writeFileSync(outPath, wav);
+					audioUrl = `/media/${fileBase}`;
+				}
+			} catch {}
+			// reset buffers for next turn
+			s.agentText = '';
+			s.turnChunks = [];
+			const resolve = s.pending.shift();
+			if (resolve) resolve({ text: textOut, audioUrl });
+		}
+	};
+
+	ws.on('open', () => {
+		if (!s) return;
+		s.isOpen = true;
+		console.log('[convai] ws open (session)', sessionId);
+		try { ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' })); } catch {}
+		s.interval = setInterval(maybeFinalizeTurn, 250);
+	});
+	ws.on('message', (raw: any) => {
+		try {
+			const msg = JSON.parse(raw.toString());
+			const t = String(msg?.type ?? '');
+			if (t === 'agent_response') {
+				if (s) s.agentText = String(msg?.agent_response_event?.agent_response ?? s.agentText);
+			} else if (t === 'audio') {
+				const b64: string = String(msg?.audio_event?.audio_base_64 ?? msg?.audio?.chunk ?? '');
+				if (b64 && s) {
+					const buf = Buffer.from(b64, 'base64');
+					s.turnChunks.push(buf);
+					s.lastAudioAt = Date.now();
+				}
+			} else if (t === 'ping') {
+				const eventId = msg?.ping_event?.event_id;
+				if (eventId != null) { try { ws.send(JSON.stringify({ type: 'pong', event_id: eventId })); } catch {} }
+			}
+		} catch {}
+	});
+	ws.on('close', () => {
+		console.log('[convai] ws close (session)', sessionId);
+		if (!s) return;
+		if (s.interval) clearInterval(s.interval);
+		convaiSessions.delete(sessionId);
+	});
+	ws.on('error', () => {
+		if (!s) return;
+		if (s.interval) clearInterval(s.interval);
+		convaiSessions.delete(sessionId);
+	});
+	return s;
+}
+
+async function elevenConversationalAnswer(question: string, contextText: string | undefined, sessionId: string): Promise<{ text: string; audioUrl: string | null }> {
+	if (!ELEVEN_API_KEY || !ELEVEN_AGENT_ID) {
+		console.warn('[convai] missing ELEVEN credentials or agent id');
+		return { text: '', audioUrl: null };
+	}
+	const id = sessionId || 'default';
+	const s = await ensureConvaiSession(id);
+	// send optional context
+	if (contextText && contextText.trim()) {
+		try { s.ws.send(JSON.stringify({ type: 'contextual_update', text: contextText.trim() })); } catch {}
+	}
+	// send user question and await this turn's resolution
+	return await new Promise<{ text: string; audioUrl: string | null }>((resolve) => {
+		s.pending.push(resolve);
+		try { s.ws.send(JSON.stringify({ type: 'user_message', text: question })); } catch {}
+	});
+}
+
+// Session memory (simple in-memory per sessionId)
+const sessionMemory = new Map<string, Array<{ role: 'user' | 'assistant'; text: string }>>();
+function pushMemory(sessionId: string, role: 'user' | 'assistant', text: string) {
+	if (!sessionId) return;
+	const arr = sessionMemory.get(sessionId) ?? [];
+	arr.push({ role, text: (text || '').slice(0, 800) });
+	// keep last 6 messages (3 turns)
+	while (arr.length > 6) arr.shift();
+	sessionMemory.set(sessionId, arr);
+}
+function summarizeMemory(sessionId: string): string {
+	const arr = sessionMemory.get(sessionId) ?? [];
+	if (!arr.length) return '';
+	return arr.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join(' \n ');
 }
 
 app.post('/agent/query', async (req, res) => {
+	try {
+		const q = String(req.body?.q ?? '').trim();
+		const videoId = String(req.body?.videoId ?? '').trim();
+		const currentTime = Number(req.body?.currentTime ?? 0);
+		const sessionId = String(req.body?.sessionId ?? '').trim();
+		if (!q) return res.status(400).json({ error: 'missing q' });
+		// Build brief context from transcript near current time (no prompt override, no extra memory)
+		let context = '';
+		if (videoId) {
+			const segs = await getTranscriptSegments(videoId, false);
+			if (segs.length) {
+				const around = segs.filter((s: any) => {
+					const start = typeof s.start === 'number' ? s.start : (typeof s.offset === 'number' ? s.offset / 1000 : 0);
+					return Math.abs(start - currentTime) <= 90; // +/- 90s
+				}).slice(0, 20).map((s: any) => s.text).join(' ');
+				context = `Transcript excerpt near t=${Math.max(0, Math.floor(currentTime))}s: ${around}`;
+			}
+		}
+
+		// Prefer ElevenLabs Conversational AI with persistent sessions
+		if (ELEVEN_API_KEY && ELEVEN_AGENT_ID) {
+			const { text, audioUrl } = await elevenConversationalAnswer(q, context || undefined, sessionId);
+			return res.json({ text, sources: [], audioUrl });
+		}
+
+		// Fallback: web search + OpenAI + ElevenLabs TTS (unchanged)
+		const web = await tavilySearch(q);
+		const answer = await synthesizeAnswer(q, web, context || undefined);
+		const audioUrl = await elevenTTS(answer);
+		res.json({ text: answer, sources: web.map((s, i) => ({ i: i + 1, title: s.title, url: s.url })), audioUrl });
+	} catch (e) {
+		console.error('[daemon] /agent/query error', e);
+		res.status(500).json({ error: 'agent failed' });
+	}
+});
+
+// CORS for tool webhook (restrict as needed)
+app.options('/tools/web_search', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.status(204).end();
+});
+
+app.post('/tools/web_search', async (req, res) => {
   try {
-    const q = String(req.body?.q ?? '').trim();
-    const videoId = String(req.body?.videoId ?? '').trim();
-    const currentTime = Number(req.body?.currentTime ?? 0);
-    if (!q) return res.status(400).json({ error: 'missing q' });
-    // Build brief context from transcript near current time
-    let context = '';
-    if (videoId) {
-      const segs = await getTranscriptSegments(videoId, false);
-      if (segs.length) {
-        const around = segs.filter((s: any) => {
-          const start = typeof s.start === 'number' ? s.start : (typeof s.offset === 'number' ? s.offset / 1000 : 0);
-          return Math.abs(start - currentTime) <= 90; // +/- 90s
-        }).slice(0, 20).map((s: any) => s.text).join(' ');
-        context = around;
-      }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (!TOOL_SECRET || req.header('x-tool-secret') !== TOOL_SECRET) {
+      return res.status(401).json({ error: 'unauthorized' });
     }
-    const web = await tavilySearch(q);
-    const answer = await synthesizeAnswer(q, web, context);
-    const audioUrl = await elevenTTS(answer);
-    res.json({ text: answer, sources: web.map((s, i) => ({ i: i + 1, title: s.title, url: s.url })), audioUrl });
+    const query = String(req.body?.query ?? req.body?.q ?? '').trim();
+    const context = String(req.body?.context ?? '').trim();
+    if (!query) return res.status(400).json({ error: 'missing query' });
+    const web = await tavilySearch(query);
+    const answer = await synthesizeAnswer(query, web, context || undefined);
+    return res.json({ answer, sources: web.map((s, i) => ({ i: i + 1, title: s.title, url: s.url })) });
   } catch (e) {
-    console.error('[daemon] /agent/query error', e);
-    res.status(500).json({ error: 'agent failed' });
+    console.error('[daemon] /tools/web_search error', e);
+    return res.status(500).json({ error: 'tool failed' });
   }
 });
 
