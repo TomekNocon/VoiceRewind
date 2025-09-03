@@ -451,14 +451,45 @@ function pcmToWavFromChunks(pcmChunks: Buffer[], sampleRate = 16000, numChannels
 	return pcmToWav(pcm, sampleRate, numChannels);
 }
 
+function sanitizeAgentText(text: string): string {
+	try {
+		let out = String(text || '');
+		// Remove fenced tool_* blocks: ```tool_outputs ...```, ```tool_code ...```, etc.
+		out = out.replace(/```\s*(tool_[a-z0-9_]+)[\s\S]*?```/gi, '').trim();
+		// Also remove any fenced blocks whose fence line mentions tool_* anywhere
+		out = out.replace(/```[^\n`]*tool_[a-z0-9_][^\n`]*\n[\s\S]*?```/gi, '').trim();
+		// Remove inline tool_outputs JSON blobs like: tool_outputs { ... }
+		out = out.replace(/tool_outputs\s*\{[\s\S]*?\}/gi, '').trim();
+		// Remove any fenced blocks that include web_search.search(...)
+		out = out.replace(/```[\s\S]*?web_search\.search\([\s\S]*?```/gi, '').trim();
+		// Remove unfenced inline calls to web_search.search(...) and print(web_search.search(...))
+		out = out.replace(/print\s*\(\s*web_search\.search\([\s\S]*?\)\s*\)/gi, '').trim();
+		out = out.replace(/web_search\.search\([\s\S]*?\)/gi, '').trim();
+		// Drop any leftover lines that mention tool_code/tool_outputs/tool_result
+		out = out
+			.split('\n')
+			.filter((line) => !/\btool_code\b|\btool_outputs\b|\btool_result\b/i.test(line))
+			// Drop stray backtick fence lines
+			.filter((line) => line.trim() !== '```')
+			.join('\n')
+			.trim();
+		// Collapse excess blank lines
+		out = out.replace(/\n{3,}/g, '\n\n');
+		return out;
+	} catch { return text; }
+}
+
 // Persistent ConvAI sessions keyed by sessionId
 const convaiSessions = new Map<string, {
 	ws: WebSocket;
 	isOpen: boolean;
 	sentInit: boolean;
 	lastAudioAt: number;
+	lastEventAt: number;
 	turnChunks: Buffer[];
 	agentText: string;
+	seenResponse: boolean;
+	finalReady: boolean;
 	pending: Array<(r: { text: string; audioUrl: string | null }) => void>;
 	interval: NodeJS.Timeout | null;
 }>();
@@ -468,8 +499,11 @@ async function ensureConvaiSession(sessionId: string): Promise<{
 	isOpen: boolean;
 	sentInit: boolean;
 	lastAudioAt: number;
+	lastEventAt: number;
 	turnChunks: Buffer[];
 	agentText: string;
+	seenResponse: boolean;
+	finalReady: boolean;
 	pending: Array<(r: { text: string; audioUrl: string | null }) => void>;
 	interval: NodeJS.Timeout | null;
 }> {
@@ -477,18 +511,29 @@ async function ensureConvaiSession(sessionId: string): Promise<{
 	if (s && s.ws.readyState === 1) return s;
 	let wsUrl = await getElevenSignedUrl(ELEVEN_AGENT_ID);
 	if (!wsUrl) wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
-	console.log('[convai] opening websocket (session)', sessionId);
-	const ws = new WebSocket(wsUrl);
-	s = { ws, isOpen: false, sentInit: false, lastAudioAt: 0, turnChunks: [], agentText: '', pending: [], interval: null };
+	console.log('[convai] opening websocket (session)', sessionId, 'using signed url:', Boolean(wsUrl.includes('token')));
+	
+	// Create WebSocket with proper headers
+	const ws = new WebSocket(wsUrl, {
+		headers: {
+			'xi-api-key': ELEVEN_API_KEY
+		}
+	});
+	
+	s = { ws, isOpen: false, sentInit: false, lastAudioAt: 0, lastEventAt: Date.now(), turnChunks: [], agentText: '', seenResponse: false, finalReady: false, pending: [], interval: null };
 	convaiSessions.set(sessionId, s);
 
 	const maybeFinalizeTurn = () => {
 		if (!s) return;
 		if (!s.pending.length) return;
-		const idle = Date.now() - s.lastAudioAt;
-		// consider a turn done if we have text or audio and idled for 800ms
-		if ((s.agentText || s.turnChunks.length) && idle > 800) {
-			const textOut = s.agentText;
+		const idle = Date.now() - s.lastEventAt;
+		const containsToolMarkers = /\btool_code\b|\btool_outputs\b|web_search\.search\(/i.test(s.agentText);
+		const audioReady = s.turnChunks.length && idle > 1200;
+		const textReady = s.seenResponse && idle > (containsToolMarkers ? 7000 : 3000);
+		// finalize when explicit final flag seen, or after a suitable idle following audio/response
+		if (s.finalReady || audioReady || textReady) {
+			const textOutRaw = s.agentText;
+			const textOut = sanitizeAgentText(textOutRaw);
 			let audioUrl: string | null = null;
 			try {
 				if (s.turnChunks.length) {
@@ -503,6 +548,10 @@ async function ensureConvaiSession(sessionId: string): Promise<{
 			// reset buffers for next turn
 			s.agentText = '';
 			s.turnChunks = [];
+			s.seenResponse = false;
+			s.finalReady = false;
+			s.lastAudioAt = 0;
+			s.lastEventAt = Date.now();
 			const resolve = s.pending.shift();
 			if (resolve) resolve({ text: textOut, audioUrl });
 		}
@@ -511,36 +560,125 @@ async function ensureConvaiSession(sessionId: string): Promise<{
 	ws.on('open', () => {
 		if (!s) return;
 		s.isOpen = true;
+		s.lastEventAt = Date.now();
 		console.log('[convai] ws open (session)', sessionId);
-		try { ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' })); } catch {}
-		s.interval = setInterval(maybeFinalizeTurn, 250);
+		// Send basic initialization - let agent use its configured settings
+		try { 
+			const initMsg = { type: 'conversation_initiation_client_data' };
+			console.log('[convai] sending init message:', JSON.stringify(initMsg));
+			ws.send(JSON.stringify(initMsg)); 
+		} catch (e) {
+			console.error('[convai] failed to send init message:', e);
+		}
+		s.interval = setInterval(maybeFinalizeTurn, 300);
 	});
 	ws.on('message', (raw: any) => {
 		try {
 			const msg = JSON.parse(raw.toString());
+			s!.lastEventAt = Date.now();
 			const t = String(msg?.type ?? '');
-			if (t === 'agent_response') {
-				if (s) s.agentText = String(msg?.agent_response_event?.agent_response ?? s.agentText);
+			console.log('[convai] received message type:', t);
+			
+			if (t === 'conversation_initiation_metadata') {
+				console.log('[convai] conversation initialized:', msg?.conversation_initiation_metadata_event?.conversation_id);
+			} else if (t === 'agent_response') {
+				if (s) {
+					s.agentText = String(msg?.agent_response_event?.agent_response ?? s.agentText);
+					s.seenResponse = true;
+					console.log('[convai] agent response:', s.agentText.slice(0, 100) + '...');
+					
+					// Detect if agent returned tool_code instead of executing search - check multiple patterns
+					let toolCodeMatch = s.agentText.match(/```tool_code\s*print\(web_search\.search\(queries=\["([^"]+)"\]\)\)\s*```/);
+					if (!toolCodeMatch) {
+						// Also check for the pattern without fenced blocks
+						toolCodeMatch = s.agentText.match(/tool_code\s*print\(web_search\.search\(queries=\["([^"]+)"\]\)\)/);
+					}
+					if (!toolCodeMatch) {
+						// Check for direct web_search.search calls
+						toolCodeMatch = s.agentText.match(/print\(web_search\.search\(queries=\["([^"]+)"\]\)\)/);
+					}
+					
+					if (toolCodeMatch && TAVILY_API_KEY) {
+						const query = toolCodeMatch[1];
+						console.log('[convai] detected tool_code, executing search for:', query);
+						
+						// Immediately replace tool code with a user-friendly message
+						s.agentText = s.agentText.replace(/```tool_code[\s\S]*?```/gi, 'Let me search for that information...').trim();
+						s.agentText = s.agentText.replace(/tool_code\s*print\(web_search\.search\([\s\S]*?\)\)/gi, 'Let me search for that information...').trim();
+						s.agentText = s.agentText.replace(/print\(web_search\.search\([\s\S]*?\)\)/gi, 'Let me search for that information...').trim();
+						
+						// Execute the search ourselves and send result as contextual update
+						tavilySearch(query).then(async (results) => {
+							const answer = await synthesizeAnswer(query, results);
+							console.log('[convai] search completed, found', results.length, 'results');
+							console.log('[convai] sending search result as contextual update:', answer.slice(0, 200) + '...');
+							try {
+								s.ws.send(JSON.stringify({
+									type: 'contextual_update',
+									text: `Search results for "${query}": ${answer}`
+								}));
+							} catch (e) {
+								console.error('[convai] failed to send search result:', e);
+							}
+						}).catch(e => console.error('[convai] search fallback failed:', e));
+					} else if (toolCodeMatch && !TAVILY_API_KEY) {
+						console.warn('[convai] tool_code detected but TAVILY_API_KEY not set');
+					}
+					
+					// Some payloads include is_final flag
+					if (msg?.agent_response_event?.is_final === true) s.finalReady = true;
+				}
+			} else if (t === 'agent_response_correction') {
+				// Handle corrected responses (often final)
+				if (s) {
+					const corrected = String(msg?.agent_response_correction_event?.corrected_agent_response ?? '');
+					if (corrected) {
+						s.agentText = corrected;
+						s.seenResponse = true;
+						s.finalReady = true; // Corrections are typically final
+						console.log('[convai] agent response corrected:', corrected.slice(0, 100) + '...');
+					}
+				}
 			} else if (t === 'audio') {
 				const b64: string = String(msg?.audio_event?.audio_base_64 ?? msg?.audio?.chunk ?? '');
 				if (b64 && s) {
 					const buf = Buffer.from(b64, 'base64');
 					s.turnChunks.push(buf);
 					s.lastAudioAt = Date.now();
+					console.log('[convai] received audio chunk, total chunks:', s.turnChunks.length);
 				}
 			} else if (t === 'ping') {
 				const eventId = msg?.ping_event?.event_id;
 				if (eventId != null) { try { ws.send(JSON.stringify({ type: 'pong', event_id: eventId })); } catch {} }
+			} else if (t === 'response_completed' || t === 'response_end' || t === 'done' || t === 'conversation_end') {
+				// Possible end-of-turn signals in various payloads
+				if (s) s.finalReady = true;
+				console.log('[convai] response completed signal received');
+			} else if (t === 'client_tool_call') {
+				// Tool execution started - don't finalize yet
+				console.log('[convai] tool call started:', msg?.client_tool_call?.tool_name);
+			} else if (t === 'internal_tentative_agent_response') {
+				// Tentative/interim response - usually means more is coming
+				if (s) {
+					const tentative = String(msg?.tentative_agent_response_internal_event?.tentative_agent_response ?? '');
+					if (tentative && !s.agentText) {
+						s.agentText = tentative; // Only if we don't have final text yet
+						console.log('[convai] tentative response:', tentative.slice(0, 100) + '...');
+					}
+				}
 			}
-		} catch {}
+		} catch (e) {
+			console.error('[convai] error parsing message:', e);
+		}
 	});
-	ws.on('close', () => {
-		console.log('[convai] ws close (session)', sessionId);
+	ws.on('close', (code, reason) => {
+		console.log('[convai] ws close (session)', sessionId, 'code:', code, 'reason:', reason?.toString());
 		if (!s) return;
 		if (s.interval) clearInterval(s.interval);
 		convaiSessions.delete(sessionId);
 	});
-	ws.on('error', () => {
+	ws.on('error', (err) => {
+		console.error('[convai] ws error (session)', sessionId, err);
 		if (!s) return;
 		if (s.interval) clearInterval(s.interval);
 		convaiSessions.delete(sessionId);
@@ -555,14 +693,32 @@ async function elevenConversationalAnswer(question: string, contextText: string 
 	}
 	const id = sessionId || 'default';
 	const s = await ensureConvaiSession(id);
+	
+	// Wait a moment for WebSocket to be fully ready
+	if (!s.isOpen) {
+		console.log('[convai] waiting for WebSocket to open...');
+		await new Promise(resolve => setTimeout(resolve, 1000));
+	}
+	
 	// send optional context
 	if (contextText && contextText.trim()) {
-		try { s.ws.send(JSON.stringify({ type: 'contextual_update', text: contextText.trim() })); } catch {}
+		try { 
+			s.ws.send(JSON.stringify({ type: 'contextual_update', text: contextText.trim() })); 
+			console.log('[convai] sent context update');
+		} catch {}
 	}
+	
 	// send user question and await this turn's resolution
 	return await new Promise<{ text: string; audioUrl: string | null }>((resolve) => {
 		s.pending.push(resolve);
-		try { s.ws.send(JSON.stringify({ type: 'user_message', text: question })); } catch {}
+		const userMessage = { type: 'user_message', text: question };
+		console.log('[convai] sending user message:', JSON.stringify(userMessage));
+		try { 
+			s.ws.send(JSON.stringify(userMessage));
+			console.log('[convai] user message sent successfully');
+		} catch (e) {
+			console.error('[convai] failed to send user message:', e);
+		}
 	});
 }
 
@@ -708,7 +864,12 @@ async function startAudioPipeline() {
   let frameBuf: Buffer = Buffer.alloc(0);
   const frameBytes = detector.frameLength * 2; // 16-bit PCM → bytes
 
+  let audioChunkCount = 0;
   micStream.on('data', (data: Buffer) => {
+    audioChunkCount++;
+    if (audioChunkCount % 100 === 0) {
+      console.log('[daemon] Processed', audioChunkCount, 'audio chunks, buffer size:', data.length);
+    }
     frameBuf = Buffer.concat([frameBuf, data]);
     while (frameBuf.length >= frameBytes) {
       const chunk = frameBuf.subarray(0, frameBytes);
@@ -722,8 +883,29 @@ async function startAudioPipeline() {
         captureUtterance(micStream, 3500)
           .then(async (rawPcm) => {
             const wav = pcmToWav(rawPcm, 16000, 1);
-            const message = await transcribeAndParse(wav);
-            if (message) broadcast(message);
+            const { message, text } = await transcribeAndParse(wav);
+            console.log('[daemon] Parsed result - media intent:', !!message, 'text:', text);
+            
+            if (message) {
+              // Media control intent
+              console.log('[daemon] Broadcasting media control intent:', message.intent);
+              broadcast(message);
+            } else if (text && text.trim()) {
+              // Conversational question - send to 11Labs agent
+              console.log('[daemon] Sending conversational question to agent:', text);
+              try {
+                const { text: response, audioUrl } = await elevenConversationalAnswer(text, undefined, 'voice-session');
+                console.log('[daemon] Agent response:', response);
+                if (audioUrl) {
+                  console.log('[daemon] Agent audio available at:', audioUrl);
+                  // Could broadcast this for playback in the UI
+                }
+              } catch (e) {
+                console.error('[daemon] Agent query failed:', e);
+              }
+            } else {
+              console.log('[daemon] No text transcribed or empty result');
+            }
           })
           .catch((e) => console.error('[daemon] capture error', e))
           .finally(() => {
@@ -771,10 +953,10 @@ function pcmToWav(pcmSignedLE16: Buffer, sampleRate = 16000, numChannels = 1): B
   return buffer;
 }
 
-async function transcribeAndParse(wav: Buffer): Promise<IntentMessage | null> {
+async function transcribeAndParse(wav: Buffer): Promise<{ message: IntentMessage | null; text: string }> {
   if (!process.env.OPENAI_API_KEY) {
     console.warn('[daemon] OPENAI_API_KEY not set; cannot transcribe');
-    return null;
+    return { message: null, text: '' };
   }
   try {
     const file = await OpenAI.toFile(wav, 'speech.wav');
@@ -787,11 +969,11 @@ async function transcribeAndParse(wav: Buffer): Promise<IntentMessage | null> {
     const text: string = (tr as any).text ?? '';
     console.log('[daemon] Transcript:', text);
     const intent = parseIntentFromText(text);
-    if (!intent) console.log('[daemon] No intent parsed');
-    return intent;
+    if (!intent) console.log('[daemon] No media control intent parsed, treating as conversational');
+    return { message: intent, text };
   } catch (e) {
     console.error('[daemon] transcription error', e);
-    return null;
+    return { message: null, text: '' };
   }
 }
 
