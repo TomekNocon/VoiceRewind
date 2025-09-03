@@ -27,9 +27,6 @@ let playAnswerBtn: HTMLButtonElement | null = null;
 let pendingSpeakText: string | null = null;
 let lastAudioDataUrl: string | null = null;
 let lastAudioUrl: string | null = null;
-let micBtn: HTMLButtonElement | null = null;
-let recognition: any = null;
-let recognizing = false;
 
 // Add: simple session id per page load for conversational continuity
 let sessionId: string | null = null;
@@ -102,99 +99,93 @@ function normalize(s: string): string {
     .trim();
 }
 
-function createRecognition() {
-  try {
-    const w: any = window as any;
-    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Ctor) return null;
-    const rec = new Ctor();
-    rec.lang = 'en-US';
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
-    return rec;
-  } catch { return null; }
-}
 
 function ensureOverlay() {
   if (document.getElementById('voicerewind-overlay')) return;
   const root = document.createElement('div');
   root.id = 'voicerewind-overlay';
   root.style.position = 'fixed';
-  root.style.right = '12px';
-  root.style.bottom = '12px';
+  root.style.top = '20px';
+  root.style.right = '20px';
   root.style.zIndex = '2147483647';
-  root.style.fontFamily = 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
-  root.style.background = 'rgba(0,0,0,0.6)';
-  root.style.color = '#fff';
-  root.style.padding = '8px 10px';
-  root.style.borderRadius = '8px';
-  root.style.display = 'flex';
-  root.style.gap = '8px';
-  root.style.alignItems = 'center';
-
-  const status = document.createElement('span');
-  status.id = 'vr-status';
-  status.textContent = '●';
-  status.style.color = '#f44336';
-
-  const active = document.createElement('span');
-  active.id = 'vr-active';
-  active.textContent = '(inactive)';
-  active.style.opacity = '0.8';
-
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.placeholder = 'jump to…';
-  input.style.background = '#121212';
-  input.style.color = '#fff';
-  input.style.border = '1px solid #333';
-  input.style.borderRadius = '6px';
-  input.style.padding = '4px 8px';
-  input.style.width = '160px';
-  input.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter') {
-      const q = input.value.trim();
-      if (q) {
-        await ensureTranscript();
-        await handleIntent({ intent: 'jump_to_phrase', value: q });
-      }
-    }
-  });
+  root.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+  root.style.background = 'rgba(255, 255, 255, 0.95)';
+  root.style.backdropFilter = 'blur(10px)';
+  (root.style as any).webkitBackdropFilter = 'blur(10px)';
+  root.style.color = '#1a1a1a';
+  root.style.padding = '16px';
+  root.style.borderRadius = '16px';
+  root.style.boxShadow = '0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08)';
+  root.style.border = '1px solid rgba(255, 255, 255, 0.2)';
+  root.style.minWidth = '320px';
+  root.style.maxWidth = '400px';
 
   // Ask agent input
   const ask = document.createElement('input');
   ask.type = 'text';
-  ask.placeholder = 'ask the web…';
-  ask.style.background = '#121212';
-  ask.style.color = '#fff';
-  ask.style.border = '1px solid #333';
-  ask.style.borderRadius = '6px';
-  ask.style.padding = '4px 8px';
-  ask.style.width = '200px';
+  ask.placeholder = 'Ask the web anything...';
+  ask.style.width = '100%';
+  ask.style.background = '#ffffff';
+  ask.style.color = '#1a1a1a';
+  ask.style.border = '2px solid #e5e5e5';
+  ask.style.borderRadius = '12px';
+  ask.style.padding = '12px 16px';
+  ask.style.fontSize = '14px';
+  ask.style.outline = 'none';
+  ask.style.transition = 'all 0.2s ease';
+  ask.style.boxSizing = 'border-box';
+  
+  ask.addEventListener('focus', () => {
+    ask.style.borderColor = '#007AFF';
+    ask.style.boxShadow = '0 0 0 3px rgba(0, 122, 255, 0.1)';
+  });
+  
+  ask.addEventListener('blur', () => {
+    ask.style.borderColor = '#e5e5e5';
+    ask.style.boxShadow = 'none';
+  });
+  
   ask.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter') {
       const q = ask.value.trim();
-      if (q) await queryAgent(q);
+      if (q) {
+        ask.style.opacity = '0.6';
+        ask.disabled = true;
+        await queryAgent(q);
+        ask.value = '';
+        ask.style.opacity = '1';
+        ask.disabled = false;
+        ask.focus();
+      }
     }
   });
 
   answerBox = document.createElement('div');
-  answerBox.style.maxWidth = '420px';
-  answerBox.style.fontSize = '12px';
-  answerBox.style.lineHeight = '1.2';
-  answerBox.style.maxHeight = '6em';
+  answerBox.style.marginTop = '12px';
+  answerBox.style.padding = '12px';
+  answerBox.style.background = '#f8f9fa';
+  answerBox.style.borderRadius = '10px';
+  answerBox.style.fontSize = '13px';
+  answerBox.style.lineHeight = '1.5';
+  answerBox.style.maxHeight = '200px';
   answerBox.style.overflow = 'auto';
   answerBox.style.display = 'none';
+  answerBox.style.border = '1px solid #e9ecef';
+  answerBox.style.color = '#495057';
 
   playAnswerBtn = document.createElement('button');
-  playAnswerBtn.textContent = 'Play answer';
+  playAnswerBtn.textContent = '🔊 Play Answer';
   playAnswerBtn.style.display = 'none';
-  playAnswerBtn.style.background = '#121212';
-  playAnswerBtn.style.color = '#fff';
-  playAnswerBtn.style.border = '1px solid #333';
-  playAnswerBtn.style.borderRadius = '6px';
-  playAnswerBtn.style.padding = '4px 8px';
+  playAnswerBtn.style.marginTop = '8px';
+  playAnswerBtn.style.width = '100%';
+  playAnswerBtn.style.background = '#007AFF';
+  playAnswerBtn.style.color = '#ffffff';
+  playAnswerBtn.style.border = 'none';
+  playAnswerBtn.style.borderRadius = '8px';
+  playAnswerBtn.style.padding = '8px 12px';
+  playAnswerBtn.style.fontSize = '13px';
   playAnswerBtn.style.cursor = 'pointer';
+  playAnswerBtn.style.transition = 'all 0.2s ease';
   playAnswerBtn.onclick = async () => {
     const video = getVideo();
     if (!video) return;
@@ -205,104 +196,19 @@ function ensureOverlay() {
     playAnswerBtn!.style.display = 'none';
     await playAnswerAudioOrSpeak(video, prevWasPlaying, prevVol);
   };
-
-  // Mic button
-  micBtn = document.createElement('button');
-  micBtn.textContent = '🎤';
-  micBtn.title = 'Hold to speak, release to send';
-  micBtn.style.background = '#121212';
-  micBtn.style.color = '#fff';
-  micBtn.style.border = '1px solid #333';
-  micBtn.style.borderRadius = '6px';
-  micBtn.style.padding = '4px 8px';
-  micBtn.style.cursor = 'pointer';
-
-  recognition = createRecognition();
-  if (recognition) {
-    let interim = '';
-    let finalText = '';
-    recognition.onresult = (e: any) => {
-      interim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) finalText += t;
-        else interim += t;
-      }
-      // Update ask field live
-      const askInput = Array.from(document.querySelectorAll('input')).find((el: any) => el.placeholder === 'ask the web…') as HTMLInputElement | undefined;
-      if (askInput) askInput.value = (finalText + ' ' + interim).trim();
-    };
-    recognition.onend = async () => {
-      recognizing = false;
-      micBtn!.textContent = '🎤';
-      const askInput = Array.from(document.querySelectorAll('input')).find((el: any) => el.placeholder === 'ask the web…') as HTMLInputElement | undefined;
-      const q = askInput?.value?.trim();
-      if (q) await queryAgent(q);
-    };
-    micBtn.onmousedown = () => {
-      if (recognizing) return;
-      recognizing = true;
-      finalText = '';
-      recognition.start();
-      micBtn!.textContent = '●';
-    };
-    micBtn.onmouseup = () => {
-      if (!recognizing) return;
-      recognition.stop();
-    };
-    micBtn.onmouseleave = () => {
-      if (recognizing) recognition.stop();
-    };
-  } else {
-    micBtn.disabled = true;
-    micBtn.title = 'Voice not supported in this browser';
-  }
-
-  const btn = (label: string, onClick: () => void) => {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.style.background = '#121212';
-    b.style.color = '#fff';
-    b.style.border = '1px solid #333';
-    b.style.borderRadius = '6px';
-    b.style.padding = '4px 8px';
-    b.style.cursor = 'pointer';
-    b.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      onClick();
-    });
-    return b;
-  };
-
-  const rew = btn('⏪ 10s', () => handleIntent({ intent: 'rewind', value: 10 }));
-  const fwd = btn('⏩ 10s', () => handleIntent({ intent: 'forward', value: 10 }));
-  const spdDown = btn('− speed', () => {
-    const v = Math.max(0.25, (getVideo()?.playbackRate ?? 1) - 0.25);
-    handleIntent({ intent: 'set_speed', value: v });
+  
+  playAnswerBtn.addEventListener('mouseenter', () => {
+    playAnswerBtn!.style.background = '#0056b3';
   });
-  const spdUp = btn('+ speed', () => {
-    const v = Math.min(3, (getVideo()?.playbackRate ?? 1) + 0.25);
-    handleIntent({ intent: 'set_speed', value: v });
+  
+  playAnswerBtn.addEventListener('mouseleave', () => {
+    playAnswerBtn!.style.background = '#007AFF';
   });
 
-  root.append(status, active, input, rew, fwd, spdDown, spdUp, micBtn, ask, answerBox, playAnswerBtn);
+  root.append(ask, answerBox, playAnswerBtn);
   document.body.appendChild(root);
 }
 
-function setStatus(connected: boolean) {
-  const el = document.getElementById('vr-status');
-  if (!el) return;
-  el.textContent = connected ? '●' : '○';
-  (el as HTMLElement).style.color = connected ? '#4caf50' : '#f44336';
-}
-
-function setActive(active: boolean) {
-  const el = document.getElementById('vr-active');
-  if (!el) return;
-  el.textContent = active ? '(active)' : '(inactive)';
-  (el as HTMLElement).style.opacity = active ? '1' : '0.8';
-}
 
 function connect() {
   ensureOverlay();
@@ -310,7 +216,6 @@ function connect() {
     ws = new WebSocket(DAEMON_WS);
     ws.addEventListener('open', () => {
       console.log('[VoiceRewind] Connected to daemon');
-      setStatus(true);
     });
     ws.addEventListener('message', (ev) => {
       try {
@@ -324,12 +229,10 @@ function connect() {
     });
     ws.addEventListener('close', () => {
       console.log('[VoiceRewind] Disconnected, retrying…');
-      setStatus(false);
       scheduleReconnect();
     });
     ws.addEventListener('error', () => {
       console.log('[VoiceRewind] WS error, retrying…');
-      setStatus(false);
       scheduleReconnect();
     });
   } catch {
@@ -613,7 +516,6 @@ window.addEventListener('message', () => {});
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'active-tab') {
     isActiveTab = true;
-    setActive(true);
   }
   if (msg?.type === 'heartbeat') {
     ensureOverlay();
@@ -622,6 +524,4 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 // Initialize
 ensureOverlay();
-setStatus(false);
-setActive(false);
 connect(); 
