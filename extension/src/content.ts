@@ -116,9 +116,56 @@ function ensureOverlay() {
   root.style.padding = '16px';
   root.style.borderRadius = '16px';
   root.style.boxShadow = '0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08)';
-  root.style.border = '1px solid rgba(255, 255, 255, 0.2)';
+  root.style.border = '2px solid rgba(34, 197, 94, 0.3)';
   root.style.minWidth = '320px';
   root.style.maxWidth = '400px';
+  root.style.transition = 'all 0.3s ease';
+
+  // Modern activity indicator
+  const indicator = document.createElement('div');
+  indicator.id = 'vr-indicator';
+  indicator.style.position = 'absolute';
+  indicator.style.top = '8px';
+  indicator.style.right = '8px';
+  indicator.style.width = '8px';
+  indicator.style.height = '8px';
+  indicator.style.borderRadius = '50%';
+  indicator.style.background = 'linear-gradient(45deg, #22c55e, #16a34a)';
+  indicator.style.boxShadow = '0 0 8px rgba(34, 197, 94, 0.4)';
+  indicator.style.animation = 'pulse 2s infinite';
+  
+  // Add keyframes for pulse animation
+  if (!document.getElementById('vr-styles')) {
+    const style = document.createElement('style');
+    style.id = 'vr-styles';
+    style.textContent = `
+      @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.7; transform: scale(1.1); }
+      }
+      @keyframes agentPulse {
+        0%, 100% { 
+          border-color: rgba(34, 197, 94, 0.3);
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08), 0 0 0 0 rgba(59, 130, 246, 0);
+        }
+        50% { 
+          border-color: rgba(59, 130, 246, 0.6);
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08), 0 0 0 4px rgba(59, 130, 246, 0.2);
+        }
+      }
+      .agent-speaking {
+        animation: agentPulse 1.5s infinite !important;
+      }
+      .agent-thinking {
+        border-color: rgba(245, 158, 11, 0.5) !important;
+        animation: agentPulse 1s infinite !important;
+      }
+      .agent-thinking .agent-thinking::before {
+        border-color: rgba(245, 158, 11, 0.8) !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
 
   // Ask agent input
   const ask = document.createElement('input');
@@ -205,7 +252,7 @@ function ensureOverlay() {
     playAnswerBtn!.style.background = '#007AFF';
   });
 
-  root.append(ask, answerBox, playAnswerBtn);
+  root.append(indicator, ask, answerBox, playAnswerBtn);
   document.body.appendChild(root);
 }
 
@@ -470,10 +517,22 @@ async function queryAgent(q: string) {
   const vid = getVideoIdFromUrl();
   const video = getVideo();
   const currentTime = video ? video.currentTime : 0;
+  const overlay = document.getElementById('voicerewind-overlay');
+  
   try {
+    // Show thinking state
+    if (overlay) overlay.classList.add('agent-thinking');
+    
     const resp = await chrome.runtime.sendMessage({ type: 'agentQuery', q, videoId: vid, currentTime, sessionId });
     if (!resp?.ok) throw new Error(resp?.error || 'agent failed');
     const { text, sources, audioUrl } = resp.data || {};
+    
+    // Remove thinking, add speaking state
+    if (overlay) {
+      overlay.classList.remove('agent-thinking');
+      overlay.classList.add('agent-speaking');
+    }
+    
     if (answerBox) {
       answerBox.style.display = 'block';
       const citation = Array.isArray(sources) && sources.length ? '\n\n' + sources.map((s: any) => `[${s.i}] ${s.title} - ${s.url}`).join('\n') : '';
@@ -498,12 +557,24 @@ async function queryAgent(q: string) {
       // Try ElevenLabs MP3 first (in-DOM audio with controls)
       if (lastAudioDataUrl) {
         await playAnswerAudioOrSpeak(video, prevWasPlaying, prevVol);
+        // Remove speaking state after playback
+        setTimeout(() => {
+          if (overlay) overlay.classList.remove('agent-speaking');
+        }, 1000);
         return;
       }
       // No server audio; show button to speak via Web Speech
       if (playAnswerBtn) playAnswerBtn.style.display = 'inline-block';
     }
+    
+    // Remove speaking state if no audio
+    if (overlay) overlay.classList.remove('agent-speaking');
+    
   } catch (e) {
+    // Remove all states on error
+    if (overlay) {
+      overlay.classList.remove('agent-thinking', 'agent-speaking');
+    }
     if (answerBox) {
       answerBox.style.display = 'block';
       answerBox.textContent = 'Agent error';
