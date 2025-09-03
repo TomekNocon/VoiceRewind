@@ -5,8 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/daemon.ts",
+    "dev:new": "tsx watch src/daemon-new.ts",
     "start": "node dist/daemon.js",
-    "build": "tsc -p tsconfig.json"
+    "start:new": "node dist/daemon-new.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest --coverage",
+    "type-check": "tsc --noEmit",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts",
+    "clean": "rm -rf dist cache"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
@@ -28,7 +37,14 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.11",
     "@types/ws": "^8.5.10",
+    "@eslint/js": "^9.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
     "tsx": "^4.16.2",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0"
   }
 }
